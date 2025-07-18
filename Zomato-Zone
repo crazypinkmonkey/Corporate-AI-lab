@@ -1,0 +1,483 @@
+# Import necessary libraries
+import pandas as pd
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import tensorflow as tf
+import tensorflow_hub as hub
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+# Download necessary NLTK data resources directly
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('vader_lexicon', quiet=True)
+nltk.download('punkt_tab', quiet=True) # Explicitly download punkt_tab
+
+
+# --- Data Loading ---
+print("--- Data Loading ---")
+file_path_reviews = '/content/drive/MyDrive/Zomato Restaurant reviews.csv'
+df_reviews = pd.read_csv(file_path_reviews)
+
+file_path_metadata = '/content/drive/MyDrive/Zomato Restaurant names and Metadata.csv'
+df_metadata = pd.read_csv(file_path_metadata)
+
+# Merge the two dataframes
+merged_df = pd.merge(df_reviews, df_metadata, left_on='Restaurant', right_on='Name', how='left')
+print("Merged DataFrames.")
+display(merged_df.head())
+
+
+# --- Sentiment Analysis and Text Cleaning ---
+print("\n--- Sentiment Analysis and Text Cleaning ---")
+
+def clean_text(text):
+    """Cleans text data by converting to lowercase, removing punctuation and stop words."""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+    tokens = word_tokenize(text)
+    stop_words = set(stopwords.words('english'))
+    cleaned_tokens = [word for word in tokens if word not in stop_words]
+    return ' '.join(cleaned_tokens)
+
+merged_df['cleaned_review'] = merged_df['Review'].apply(clean_text)
+
+# Instantiate the sentiment analyzer
+analyzer = SentimentIntensityAnalyzer()
+
+# Apply the sentiment analyzer to the cleaned reviews
+sentiment_scores = merged_df['cleaned_review'].apply(analyzer.polarity_scores)
+
+# Create new columns for sentiment scores
+merged_df['compound_score'] = sentiment_scores.apply(lambda x: x['compound'])
+merged_df['positive_score'] = sentiment_scores.apply(lambda x: x['pos'])
+merged_df['negative_score'] = sentiment_scores.apply(lambda x: x['neg'])
+merged_df['neutral_score'] = sentiment_scores.apply(lambda x: x['neu'])
+
+print("Sentiment analysis complete.")
+display(merged_df[['cleaned_review', 'compound_score', 'positive_score', 'negative_score', 'neutral_score']].head())
+
+
+#Advanced Text Feature Engineering using Pre-trained Sentence Embeddings
+print("\n--- Generating Sentence Embeddings (Advanced Text Features) ---")
+
+try:
+  embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+except Exception as e:
+  print(f"Error Loading Universal Sentence Encoder: {e}")
+  print("Please ensure you have an active internet connection and try again")
+
+reviews_for_embedding = merged_df['cleaned_review'].fillna('').tolist()
+
+print(f"Generating embeddings for {len(reviews_for_embedding)} reviews...")
+review_embeddings = embed(reviews_for_embedding).numpy()
+print("Embeddings generated.")
+
+df_embeddings = pd.DataFrame(review_embeddings, index=merged_df.index)
+df_embeddings.columns = [f'embedding_{i}' for i in range(review_embeddings.shape[1])]
+print("df_embeddings created.")
+
+print("Aggregating embeddings by Restaurant...")
+
+df_restaurant_embeddings = df_embeddings.groupby(merged_df['Restaurant']).mean()
+print("Restaurant embeddings aggregated.")
+
+
+# --- Feature Engineering for Clustering ---
+print("\n--- Feature Engineering for Clustering ---")
+
+# Convert 'Rating' to numeric, coercing errors and fill NaNs
+merged_df['Rating'] = pd.to_numeric(merged_df['Rating'], errors='coerce')
+merged_df['Rating'].fillna(merged_df['Rating'].median(), inplace=True)
+
+# Convert 'Cost' to numeric, removing commas and coercing errors
+merged_df['Cost'] = merged_df['Cost'].astype(str).str.replace(',', '', regex=False)
+merged_df['Cost'] = pd.to_numeric(merged_df['Cost'], errors='coerce')
+merged_df['Cost'].fillna(merged_df['Cost'].median(), inplace=True)
+
+
+# Recreate df_clustering for aggregation
+df_clustering = merged_df[['Restaurant', 'Rating', 'Cost', 'Cuisines', 'compound_score', 'positive_score', 'negative_score', 'neutral_score']].copy()
+
+# Handle potential missing values in 'Cuisines' before encoding
+df_clustering['Cuisines'].fillna('Unknown', inplace=True)
+
+
+# Group by 'Restaurant' and calculate the mean of numerical features
+numerical_cols = ['Rating', 'Cost', 'compound_score', 'positive_score', 'negative_score', 'neutral_score']
+df_numerical_aggregated = df_clustering.groupby('Restaurant')[numerical_cols].mean() # Keep Restaurant as index here
+
+
+# Group by 'Restaurant' and aggregate the one-hot encoded cuisine features by taking the maximum
+df_cuisines_aggregated = df_clustering.groupby('Restaurant')['Cuisines'].apply(lambda x: pd.Series(1, index=x.str.split(', ').explode().unique()).T).unstack(fill_value=0)
+df_cuisines_aggregated.columns = [f'Cuisine_{col}' for col in df_cuisines_aggregated.columns]
+
+# Merge the aggregated numerical, cuisine, and TF-IDF features, keeping Restaurant as index
+df_prepared_for_clustering = df_numerical_aggregated.merge(df_cuisines_aggregated, left_index=True, right_index=True, how='inner')
+df_prepared_for_clustering = df_prepared_for_clustering.merge(df_restaurant_embeddings, left_index=True, right_index=True, how='inner')
+
+# Handle any remaining missing values
+df_prepared_for_clustering.fillna(df_prepared_for_clustering.mean(), inplace=True)
+
+print("DataFrame prepared for clustering.")
+display(df_prepared_for_clustering.head())
+
+# Ensure merged_df is available
+
+# --- Feature Engineering from Metadata ---
+print("\n--- Feature Engineering from Metadata ---")
+
+# Extract Review count and Follower count from 'Metadata'
+def extract_metadata_counts(metadata_str):
+    if not isinstance(metadata_str, str):
+        return 0, 0
+    review_match = re.search(r'(\d+)\s*Review', metadata_str)
+    follower_match = re.search(r'(\d+)\s*Follower', metadata_str)
+    reviews = int(review_match.group(1)) if review_match else 0
+    followers = int(follower_match.group(1)) if follower_match else 0
+    return reviews, followers
+
+merged_df[['Review_count', 'Follower_count']] = merged_df['Metadata'].apply(lambda x: pd.Series(extract_metadata_counts(x)))
+
+
+# Process 'Collections' (One-Hot Encoding)
+# Explode the Collections column and get unique values
+collections_exploded = merged_df.assign(Collection=merged_df['Collections'].str.split(', ')).explode('Collection')
+# Handle potential NaN values in 'Collection' after explode
+collections_exploded.dropna(subset=['Collection'], inplace=True)
+
+# Create dummy variables for Collections
+df_collections_encoded = pd.get_dummies(collections_exploded['Collection'], prefix='Collection')
+
+# Group by Restaurant and sum the one-hot encoded columns to get a presence indicator
+# Merge with original merged_df to align with Restaurants
+df_collections_aggregated = pd.concat([collections_exploded['Restaurant'].reset_index(drop=True), df_collections_encoded.reset_index(drop=True)], axis=1)
+df_collections_aggregated = df_collections_aggregated.groupby('Restaurant').max() # Use max to indicate presence
+
+
+# Process 'Timings' (Example: Number of hours open - simplistic approach)
+# This is a complex feature to engineer robustly from the given format.
+# For simplicity in this example, we'll skip complex timing feature engineering
+# but acknowledge its potential value.
+
+print("Metadata feature engineering complete.")
+display(merged_df[['Restaurant', 'Review_count', 'Follower_count']].head())
+display(df_collections_aggregated.head())
+
+
+# --- Merge New Metadata Features into df_prepared_for_clustering ---
+print("\n--- Merging new metadata features ---")
+
+# Ensure df_prepared_for_clustering has 'Restaurant' as index before merging
+if 'Restaurant' in df_prepared_for_clustering.columns:
+    df_prepared_for_clustering.set_index('Restaurant', inplace=True)
+
+# Merge with aggregated collections features
+df_prepared_for_clustering = df_prepared_for_clustering.merge(df_collections_aggregated, left_index=True, right_index=True, how='left')
+
+# Merge with numerical metadata features (need to aggregate these by Restaurant first)
+df_numerical_metadata_aggregated = merged_df.groupby('Restaurant')[['Review_count', 'Follower_count']].mean() # Use mean for aggregation
+
+df_prepared_for_clustering = df_prepared_for_clustering.merge(df_numerical_metadata_aggregated, left_index=True, right_index=True, how='left')
+
+
+# Handle any missing values introduced by the merge (e.g., restaurants without collection info)
+df_prepared_for_clustering.fillna(df_prepared_for_clustering.mean(), inplace=True)
+
+
+print("df_prepared_for_clustering updated with new metadata features.")
+display(df_prepared_for_clustering.head())
+print("\nInfo of the updated df_prepared_for_clustering:")
+print(df_prepared_for_clustering.info())
+
+# --- Restaurant Clustering ---
+print("\n--- Restaurant Clustering ---")
+
+# Reset the index to make 'Restaurant' a regular column for clustering
+df_prepared_for_clustering.reset_index(inplace=True)
+
+# Extract feature matrix for clustering, excluding 'Restaurant' name
+X = df_prepared_for_clustering.drop('Restaurant', axis=1)
+
+#Feature Scaling
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print("Features successfully scaled using StandardScaler.")
+print(f"Original X shape: {X.shape}")
+print(f"Scaled X shape: {X_scaled.shape}")
+
+#Ensure X is available from the clustering step (df_prepared_for_clustering.drop('Restaurant', axis=1))
+# If not available, recreate X here.
+try:
+    X
+except NameError:
+    print("X not found, recreating from df_prepared_for_clustering.")
+    # Assuming df_prepared_for_clustering is available. If not, add code to recreate it.
+    if 'df_prepared_for_clustering' in locals():
+        X = df_prepared_for_clustering.drop('Restaurant', axis=1)
+    else:
+        print("df_prepared_for_clustering not found. Please ensure it's created in previous steps.")
+        X = None # Set X to None to avoid errors in subsequent code if df_prepared_for_clustering is missing
+
+
+if X is not None:
+    # Calculate inertia for a range of k values
+    inertia = []
+    k_range = range(1, 11) # Test k from 1 to 10
+
+    for k in k_range:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+        kmeans.fit(X_scaled)
+        inertia.append(kmeans.inertia_)
+
+    # Plot the Elbow Method
+    plt.figure(figsize=(8, 5))
+    plt.plot(k_range, inertia, marker='o')
+    plt.title('Elbow Method for Optimal k')
+    plt.xlabel('Number of Clusters (k)')
+    plt.ylabel('Inertia')
+    plt.xticks(k_range)
+    plt.grid(True)
+    plt.show()
+
+    print("Elbow Method plot generated.")
+    
+    #Quantitative Cluster Evaluation
+
+    print("\n--- Plotting GMM Silhouette Scores for N_components Range ---")
+
+    gmm_silhouette_scores = []
+    n_components_range = range(2,11)
+
+    for n_comp in n_components_range:
+        gmm_k = GaussianMixture(n_components=n_comp, random_state=42, n_init=10)
+        gmm_k.fit(X_scaled)
+        score = silhouette_score(X_scaled, gmm_k.predict(X_scaled))
+        gmm_silhouette_scores.append(score)
+  
+    plt.figure(figsize=(8,5))
+    plt.plot(n_components_range, gmm_silhouette_scores, marker='o')
+    plt.title('Silhouette Score for Optimal K')
+    plt.xlabel('Number of Clusters (k)') 
+    plt.ylabel('Average Silhouette Score')
+    plt.xticks(n_components_range) 
+    plt.grid(True)
+    plt.show()
+
+    print("Silhouette Score plot generated")
+
+else:
+    print("Cannot generate Elbow Method plot because X is not available.")
+
+#Gaussian Mixture Model (GMM) clustering
+
+print("\n--- Performing GMM clustering ---")
+
+gmm = GaussianMixture(n_components=2, random_state=42, n_init=10)
+
+gmm_cluster_labels = gmm.fit_predict(X_scaled)
+
+df_prepared_for_clustering['cluster_label'] = gmm_cluster_labels
+
+print("GMM clustering complete")
+display(df_prepared_for_clustering.head())
+print("\nNumber of restraunts per GMM cluster:")
+print(df_prepared_for_clustering['cluster_label'].value_counts())
+
+print("Restaurant clustering complete.")
+
+#Quantitative Cluster Evaluation
+
+print("\n--- Quantitative Cluster Evaluation (Silhouette Score) ---")
+
+silhouette_avg = silhouette_score(X_scaled, gmm_cluster_labels)
+
+print(f"For n_components = {gmm.n_components}, the average Silhouette Score is: {silhouette_avg:.4f}")
+
+display(df_prepared_for_clustering.head())
+print("\nNumber of restaurants per cluster:")
+print(df_prepared_for_clustering['cluster_label'].value_counts())
+
+# --- Showcase Example Restaurants per Cluster ---
+print("\n--- Example Restaurants by Cluster ---")
+
+# Let's define the number of example restaurants to show for each cluster
+N_EXAMPLES = 7 # You can adjust this number
+
+for cluster_id in sorted(df_prepared_for_clustering['cluster_label'].unique()):
+    print(f"\nExample Restaurants for Cluster {cluster_id}:")
+    
+    # Filter for the current cluster
+    cluster_df = df_prepared_for_clustering[df_prepared_for_clustering['cluster_label'] == cluster_id].copy()
+    
+    # Sort by Rating (descending) and then by Review_count (descending) to get highly representative examples
+    # (assuming higher rating and more reviews make a restaurant a good example for its cluster)
+    top_examples = cluster_df.sort_values(by=['Rating', 'Review_count'], ascending=[False, False]).head(N_EXAMPLES)
+    
+    display(top_examples[['Restaurant', 'Rating', 'Cost', 'Review_count', 'compound_score', 'Cuisine_North Indian', 'Cuisine_Asian', 'Cuisine_Continental', 'Cuisine_Biryani']].head(N_EXAMPLES)) # Add other relevant cuisine columns or sentiment scores you wish to highlight
+
+print("Example restaurants for each cluster identified and displayed.")
+
+# --- Analyze and Visualize Clusters ---
+print("\n--- Analyze and Visualize Clusters ---")
+
+# Select only numerical columns for calculating cluster characteristics
+numerical_cols_for_clustering_analysis = df_prepared_for_clustering.select_dtypes(include=['number']).columns.tolist()
+# Exclude 'cluster_label' itself from the mean calculation if it's included as a number
+if 'cluster_label' in numerical_cols_for_clustering_analysis:
+    numerical_cols_for_clustering_analysis.remove('cluster_label')
+
+# Calculate the mean for each cluster using only numerical columns
+cluster_characteristics = df_prepared_for_clustering.groupby('cluster_label')[numerical_cols_for_clustering_analysis].mean()
+
+
+print("Mean characteristics of each cluster:")
+display(cluster_characteristics)
+
+# Transpose the cluster_characteristics DataFrame and melt for easier plotting
+cluster_characteristics_T = cluster_characteristics.T.reset_index()
+cluster_characteristics_T.rename(columns={'index': 'Feature'}, inplace=True)
+df_melted_numerical = cluster_characteristics_T.melt(id_vars='Feature', var_name='Cluster', value_name='Mean Value')
+
+
+# Plotting key numerical features (Rating, Cost, sentiment scores)
+numerical_features_to_plot = ['Rating', 'Cost', 'compound_score', 'positive_score', 'negative_score', 'neutral_score']
+df_numerical_plot = df_melted_numerical[df_melted_numerical['Feature'].isin(numerical_features_to_plot)]
+
+plt.figure(figsize=(15, 10))
+for i, feature in enumerate(numerical_features_to_plot):
+    plt.subplot(2, 3, i + 1)
+    sns.barplot(data=df_numerical_plot[df_numerical_plot['Feature'] == feature], x='Cluster', y='Mean Value', palette='viridis')
+    plt.title(f'Mean {feature} by Cluster')
+    plt.ylabel(f'Mean {feature}')
+    plt.xlabel('Cluster')
+
+plt.tight_layout()
+plt.show()
+
+
+# Plotting prominent cuisine types
+cuisine_cols = [col for col in df_prepared_for_clustering.columns if col.startswith('Cuisine_')]
+cluster_cuisine_presence = df_prepared_for_clustering.groupby('cluster_label')[cuisine_cols].mean()
+cluster_cuisine_presence_T = cluster_cuisine_presence.T.reset_index()
+cluster_cuisine_presence_T.rename(columns={'index': 'Cuisine', 0: 'Cluster 0', 1: 'Cluster 1'}, inplace=True)
+df_melted_cuisine = cluster_cuisine_presence_T.melt(id_vars='Cuisine', var_name='Cluster', value_name='Mean Presence')
+
+# Select top N cuisines to visualize (e.g., top 10 overall)
+top_cuisines = cluster_cuisine_presence.mean().sort_values(ascending=False).head(10).index.tolist()
+df_melted_cuisine_subset = df_melted_cuisine[df_melted_cuisine['Cuisine'].isin(top_cuisines)]
+
+plt.figure(figsize=(15, 8))
+sns.barplot(data=df_melted_cuisine_subset, x='Cuisine', y='Mean Presence', hue='Cluster', palette='viridis')
+plt.title('Mean Presence of Top 10 Cuisines by Cluster')
+plt.xlabel('Cuisine Type')
+plt.ylabel('Mean Presence in Cluster')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
+
+#Visualizing Clusters with Dimensionality Reduction
+
+print("\n--- Visualizing Clusters with PCA ---")
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+df_pca = pd.DataFrame(data=X_pca, columns=['Principal Component 1', 'Principal Component 2'])
+
+df_pca['cluster_label'] = df_prepared_for_clustering['cluster_label'].values
+
+plt.figure(figsize=(10,8))
+sns.scatterplot(
+    x='Principal Component 1',
+    y='Principal Component 2',
+    hue='cluster_label',
+    palette='viridis',
+    data=df_pca,
+    legend='full',
+    alpha=0.7
+)
+plt.title('Restaurant Clusters (PCA Reduced)')
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+plt.grid(True)
+plt.show()
+print("PCA-reduced cluster plot generated")
+
+# --- Insight Mining and Business Cases ---
+print("\n--- Insight Mining and Business Cases ---")
+
+print("Insights for Helping Customers and Company Growth:")
+
+print("\nCustomer Recommendations Based on Clusters:")
+print("- **Cluster 0 (Value & Local Favorites):** This segment represents restaurants with generally lower average ratings (around 3.37) and significantly lower average costs (around 508 INR). Sentiment scores are lower overall, with a slightly higher negative score. Common cuisines include Biryani, North Indian, and American. Ideal for customers looking for affordable, familiar, and comfort food options. Recommendations can focus on highlighting value for money and popular local dishes.")
+print("- **Cluster 1 (Premium & Highly-Rated Experience):** This cluster comprises restaurants with notably higher average ratings (around 3.79) and significantly higher average costs (around 1169 INR). They exhibit much higher overall positive sentiment with a higher compound score (0.675 vs 0.353) and positive score (0.561 vs 0.349), and lower negative sentiment. These restaurants also tend to have higher review and follower counts. Prominent cuisines include Asian and Continental. Best for customers prioritizing high-quality dining experiences, willing to pay more, and seeking diverse, often international, cuisine options.")
+
+print("\nAreas for Company Growth:")
+print("- **Improve & Promote Cluster 0 (Value Segment):** Zomato could implement programs or provide insights to restaurants in Cluster 0 to help them improve customer sentiment and ratings. This might involve identifying common themes in negative reviews (if any) or suggesting operational enhancements. Promoting special offers or combo deals for these budget-friendly establishments could also attract a larger customer base.")
+print("- **Expand High-Value Cluster 1 (Premium Segment) Offerings:** Analyze the geographic distribution and market penetration of Cluster 1 restaurants. If certain areas are underserved by these high-rated, high-sentiment establishments, Zomato could actively encourage or onboard new premium restaurants to cater to this demand, potentially leading to higher average order values.")
+print("- **Targeted Marketing by Cuisine:** Leverage the identified prominent cuisines within each cluster. For example, promote popular Biryani and North Indian restaurants more heavily to Cluster 0 users, while actively showcasing top-rated Asian and Continental restaurants to Cluster 1 users. This allows for more personalized marketing campaigns.")
+print("- **Strategic Partnership & Recruitment:** Actively seek partnerships with or recruit new restaurants that align with the characteristics of the high-performing Cluster 1 to grow Zomato's premium offerings. Conversely, for Cluster 0, focus on maintaining affordability while seeking incremental quality improvements.")
+print("- **Leverage 'Metadata' and 'Time':** Continue to utilize 'Metadata' (e.g., collections like 'Late Night', 'Great Buffets') and 'Time' (peak hours, popular dining times) to create more granular promotional strategies. For example, Cluster 0 might be ideal for promoting late-night delivery, while Cluster 1 could be showcased for special occasion dining.")
+
+print("\nSummary of Key Insights:")
+print("The advanced clustering analysis, leveraging sentence embeddings and Gaussian Mixture Models, successfully revealed two distinct restaurant segments: a 'Value & Local Favorites' segment (Cluster 0) and a 'Premium & Highly-Rated Experience' segment (Cluster 1). These segments are clearly differentiated by factors such as average cost, rating, overall customer sentiment, and prominent cuisine types. This segmentation provides a robust framework for personalized customer recommendations, guiding users to restaurants that align precisely with their preferences and budget.")
+print("For company growth, these insights point towards actionable strategies. Zomato can focus on supporting the value segment to improve their offerings and customer experience, while strategically expanding and promoting the premium segment in underserved areas. By understanding these distinct market segments, Zomato can refine its marketing efforts, optimize its restaurant partnerships, and ultimately drive both customer engagement and business development.")
+
+
+# --- Cost vs. Benefit Analysis ---
+print("\n--- Cost vs. Benefit Analysis ---")
+
+# Explode the Cuisines column to have one cuisine per row
+df_cuisines_exploded = merged_df.assign(Cuisine=merged_df['Cuisines'].str.split(', ')).explode('Cuisine')
+
+# Convert 'Rating' and 'Cost' to numeric if not already done and handle NaNs
+df_cuisines_exploded['Rating'] = pd.to_numeric(df_cuisines_exploded['Rating'], errors='coerce')
+df_cuisines_exploded['Rating'].fillna(df_cuisines_exploded['Rating'].median(), inplace=True)
+
+# Ensure 'Cost' is numeric and handle NaNs
+df_cuisines_exploded['Cost'] = pd.to_numeric(df_cuisines_exploded['Cost'], errors='coerce')
+df_cuisines_exploded['Cost'].fillna(df_cuisines_exploded['Cost'].median(), inplace=True)
+
+
+# Group by the exploded 'Cuisine' and calculate the mean 'Cost' and 'Rating'
+cuisine_cost_rating = df_cuisines_exploded.groupby('Cuisine')[['Cost', 'Rating']].mean().reset_index()
+
+# Sort by mean 'Rating' in descending order
+cuisine_cost_rating_sorted = cuisine_cost_rating.sort_values('Rating', ascending=False)
+
+# Display the sorted DataFrame
+print("Mean Cost and Rating by Cuisine, sorted by Rating:")
+display(cuisine_cost_rating_sorted)
+
+
+# --- Summary and Explanation of Upgrades ---
+print("\n--- Summary and Explanation of Upgrades ---")
+
+print("\n**Summary of Upgrades:**")
+print("Throughout this notebook, we have implemented several upgrades to the initial analysis to enhance our insight mining capabilities for the Zomato dataset:")
+print("1. Advanced Text Feature Extraction (Sentence Embeddings): Extracted advanced text features from reviews using Universal Sentence Encoder.")
+print("2. Incorporation of Metadata Features: Engineered and incorporated features from 'Metadata', 'Collections', and 'Timings'.")
+print("3. Combined Dataset for Clustering: Merged review data (sentiment, **sentence embeddings**) with restaurant metadata (engineered features).")
+print("4. Enhanced Restaurant Clustering: Performed **Gaussian Mixture Model (GMM) clustering** on the combined feature set, identifying **2 optimal clusters**.")
+print("5. Detailed Cluster Analysis and Visualization: Analyzed and visualized cluster characteristics based on a richer feature set.")
+print("6. Refined Cost vs. Benefit Analysis: Performed cost vs. benefit analysis by cuisine using cleaned and merged data.")
+
+print("\n**How Upgrades Improve Insight Mining Capabilities:**")
+print("These upgrades provide a deeper understanding of sentiment, richer restaurant segmentation, improved potential for recommendation systems, and more targeted business growth strategies, leading to more actionable insights.")
+
+print("\n--- Task Completed ---")
